@@ -20,9 +20,6 @@ This repository contains the official code for the paper accepted at the **2025 
 
 The project is designed as a modular, end-to-end forecasting pipeline that processes raw sales and COVID-19 data to produce actionable, SKU-level monthly forecasts for manufacturing integration.
 
- 
-*(Note: I've hosted a screenshot of your paper's Figure 2. You can also take your own screenshot, upload it to the repository in an `assets` folder, and link to it directly.)*
-
 ---
 
 ## Key Results: SKU-Level Forecast Performance
