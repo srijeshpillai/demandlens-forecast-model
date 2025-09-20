@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+env/
+
+# IDE specific
+.vscode/
+.idea/
+
+# Data files - DO NOT UPLOAD
+data/*.csv
+
+# Checkpoint files
+*.pkl

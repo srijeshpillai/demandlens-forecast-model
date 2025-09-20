@@ -1,0 +1,5 @@
+pandas
+prophet
+matplotlib
+# The script uses a specific numpy version implicitly. 
+# Prophet will handle the installation of the correct numpy version.
