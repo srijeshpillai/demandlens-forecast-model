@@ -20,6 +20,7 @@ This repository contains the official code for the paper accepted at the **2025 
 
 The project is designed as a modular, end-to-end forecasting pipeline that processes raw sales and COVID-19 data to produce actionable, SKU-level monthly forecasts for manufacturing integration.
 
+<img src="demandlens-architecture.png" width="800">
 ---
 
 ## Key Results: SKU-Level Forecast Performance
