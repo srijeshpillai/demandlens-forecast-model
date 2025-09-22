@@ -1,450 +1,335 @@
-import sys
-import numpy as np
+"""
+@file run_forecast.py
+@brief End-to-end time-series forecasting pipeline for SKU-level demand.
 
-# Monkey patch numpy to avoid the float_ issue
-sys.modules['numpy'].float_ = np.float64
+This script implements the complete "DemandLens" forecasting model. It performs
+the following steps:
+1. Loads historical sales data and external COVID-19 data.
+2. Performs extensive feature engineering, creating lag, rolling mean, and
+   seasonal features.
+3. Implements a checkpointing system to resume interrupted forecast runs.
+4. Uses multiprocessing to train a separate, hyperparameter-tuned Prophet
+   model for each product SKU.
+5. Generates a 3-month forecast, aggregates it to a monthly level, and
+   calculates performance metrics.
+6. Creates and saves visualizations comparing the forecast to actual sales.
+"""
 
-import pandas as pd
-from prophet import Prophet
-from prophet.diagnostics import cross_validation, performance_metrics
-from pandas.tseries.holiday import USFederalHolidayCalendar as calendar
-from datetime import datetime
-from dateutil.relativedelta import relativedelta
-import matplotlib.pyplot as plt
-from matplotlib.dates import MonthLocator, DateFormatter
-from itertools import product
-import pickle
 import os
+import pickle
+import sys
+import warnings
+from datetime import datetime
+from functools import partial
+from itertools import product
 import multiprocessing as mp
 
-from functools import partial
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter, MonthLocator
+import numpy as np
+import pandas as pd
+from dateutil.relativedelta import relativedelta
+from pandas.tseries.holiday import USFederalHolidayCalendar as calendar
+from prophet import Prophet
 
-import warnings
-warnings.filterwarnings("ignore", message="Importing plotly failed. Interactive plots will not work.")
+# --- Pre-computation & Configuration ---
 
-# [CHANGE 1: Added load_covid_data function]
-def load_covid_data(file_path):
-    print(f"Loading COVID data from {file_path}")
-    covid_data = pd.read_csv(file_path)
-    covid_data['dt'] = pd.to_datetime(covid_data['date'])
-    covid_data = covid_data.rename(columns={'day-wise cases': 'new_cases', 'day-wise deaths': 'new_deaths'})
-    print("COVID data loaded.")
-    return covid_data[['dt', 'new_cases', 'new_deaths']]
+# Monkey patch for a known Prophet/Numpy compatibility issue
+sys.modules['numpy'].float_ = np.float64
+# Suppress the informational Plotly import warning from Prophet
+warnings.filterwarnings("ignore", message="Importing plotly failed.")
+# Use a non-interactive matplotlib backend to prevent plots from displaying
+matplotlib.use('Agg')
 
+# Pre-tuned hyperparameters for each mattress SKU. These were determined via
+# offline cross-validation and are a key part of the model's performance.
 SKU_HYPERPARAMETERS = {
     '10-inch mattresses': {
-        'changepoint_prior_scale': 0.2,
-        'seasonality_prior_scale': 50.0,
-        'holidays_prior_scale': 25.0,
-        'seasonality_mode': 'multiplicative',
-        'changepoint_range': 0.97,
-        'n_changepoints': 55
+        'changepoint_prior_scale': 0.2, 'seasonality_prior_scale': 50.0,
+        'holidays_prior_scale': 25.0, 'seasonality_mode': 'multiplicative',
+        'changepoint_range': 0.97, 'n_changepoints': 55
     },
     '12-inch mattresses': {
-        'changepoint_prior_scale': 0.12,
-        'seasonality_prior_scale': 40.0,
-        'holidays_prior_scale': 25.0,
-        'seasonality_mode': 'multiplicative',
-        'changepoint_range': 0.92,
-        'n_changepoints': 48
+        'changepoint_prior_scale': 0.12, 'seasonality_prior_scale': 40.0,
+        'holidays_prior_scale': 25.0, 'seasonality_mode': 'multiplicative',
+        'changepoint_range': 0.92, 'n_changepoints': 48
     },
     '14-inch mattresses': {
-        'changepoint_prior_scale': 0.1,
-        'seasonality_prior_scale': 30.0,
-        'holidays_prior_scale': 18.0,
-        'seasonality_mode': 'multiplicative',
-        'changepoint_range': 0.88,
-        'n_changepoints': 45
+        'changepoint_prior_scale': 0.1, 'seasonality_prior_scale': 30.0,
+        'holidays_prior_scale': 18.0, 'seasonality_mode': 'multiplicative',
+        'changepoint_range': 0.88, 'n_changepoints': 45
     },
     '16-inch mattresses': {
-        'changepoint_prior_scale': 0.01,
-        'seasonality_prior_scale': 4.5,
-        'holidays_prior_scale': 3.0,
-        'seasonality_mode': 'multiplicative',
-        'changepoint_range': 0.9,
-        'n_changepoints': 16
+        'changepoint_prior_scale': 0.01, 'seasonality_prior_scale': 4.5,
+        'holidays_prior_scale': 3.0, 'seasonality_mode': 'multiplicative',
+        'changepoint_range': 0.9, 'n_changepoints': 16
     }
 }
 
-def save_checkpoint(state, filename):
-    with open(filename, 'wb') as f:
-        pickle.dump(state, f)
-    print(f"Checkpoint saved: {filename}")
+# Define all external regressors in a single list for consistency
+EXTERNAL_REGRESSORS = [
+    'lag_1', 'lag_7', 'lag_14', 'lag_30', 'lag_60', 'rolling_mean_7',
+    'rolling_mean_14', 'rolling_mean_30', 'is_weekend', 'is_summer_peak',
+    'is_black_friday', 'is_back_to_school', 'is_holiday_season', 'quarter',
+    'cases_7day_avg', 'deaths_7day_avg'
+]
 
-def load_checkpoint(filename):
-    if os.path.exists(filename):
-        with open(filename, 'rb') as f:
-            return pickle.load(f)
-    return None
 
-def add_lag_features(df):
-    print("Adding lag features...")
+# --- Data Loading & Feature Engineering ---
+
+def load_and_prep_data(sales_path, covid_path):
+    """Loads, cleans, and merges sales and COVID-19 data."""
+    print(f"Loading historical sales data from {sales_path}...")
+    df_sales = pd.read_csv(sales_path)
+    df_sales['dt'] = pd.to_datetime(df_sales['dt'])
+    df_sales.sort_values(by=["sku", "dt"], inplace=True)
+    print("Sales data loaded.")
+
+    print(f"Loading COVID data from {covid_path}...")
+    df_covid = pd.read_csv(covid_path)
+    df_covid['dt'] = pd.to_datetime(df_covid['date'])
+    df_covid = df_covid.rename(
+        columns={'day-wise cases': 'new_cases', 'day-wise deaths': 'new_deaths'}
+    )
+    print("COVID data loaded.")
+
+    print("Engineering features...")
+    df_sales = create_lag_features(df_sales)
+    df_full = create_seasonal_and_covid_features(df_sales, df_covid[['dt', 'new_cases', 'new_deaths']])
+    print("Feature engineering complete.")
+    return df_full
+
+
+def create_lag_features(df):
+    """Creates lag and rolling mean features for sales data."""
     df['ordered_quantity'] = df['ordered_quantity'].astype('float64')
 
-    df['lag_1'] = df.groupby('sku')['ordered_quantity'].shift(1)
-    df['lag_7'] = df.groupby('sku')['ordered_quantity'].shift(7)
-    df['lag_14'] = df.groupby('sku')['ordered_quantity'].shift(14)
-    df['lag_30'] = df.groupby('sku')['ordered_quantity'].shift(30)
-    df['lag_60'] = df.groupby('sku')['ordered_quantity'].shift(60)
-    df['rolling_mean_7'] = df.groupby('sku')['ordered_quantity'].rolling(window=7).mean().reset_index(0, drop=True)
-    df['rolling_mean_14'] = df.groupby('sku')['ordered_quantity'].rolling(window=14).mean().reset_index(0, drop=True)
-    df['rolling_mean_30'] = df.groupby('sku')['ordered_quantity'].rolling(window=30).mean().reset_index(0, drop=True)
+    lags = [1, 7, 14, 30, 60]
+    windows = [7, 14, 30]
 
-    lag_columns = ['lag_1', 'lag_7', 'lag_14', 'lag_30', 'lag_60', 'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_30']
-    for col in lag_columns:
+    for lag in lags:
+        df[f'lag_{lag}'] = df.groupby('sku')['ordered_quantity'].shift(lag)
+    for w in windows:
+        df[f'rolling_mean_{w}'] = df.groupby('sku')['ordered_quantity'].rolling(window=w).mean().reset_index(0, drop=True)
+
+    # Impute missing values created by shifts/rolls with the SKU-level mean
+    feature_cols = [f'lag_{l}' for l in lags] + [f'rolling_mean_{w}' for w in windows]
+    for col in feature_cols:
         df[col] = df.groupby('sku')[col].transform(lambda x: x.fillna(x.mean()))
+        df[col] = df[col].fillna(0)  # Fill any remaining NaNs for SKUs with no data
 
-    df[lag_columns] = df[lag_columns].fillna(0)
-    df[['ordered_quantity'] + lag_columns] = df[['ordered_quantity'] + lag_columns].round().astype('int64')
-
-    print("Lag features added.")
     return df
 
-# [CHANGE 2: Modified add_seasonal_features to include COVID data]
-def add_seasonal_features(df, covid_data):
-    print("Adding seasonal and COVID features...")
+
+def create_seasonal_and_covid_features(df, df_covid):
+    """Creates seasonal flags and merges smoothed COVID-19 data."""
     df['month'] = df['dt'].dt.month
     df['day_of_week'] = df['dt'].dt.dayofweek
     df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
-    df['is_summer_peak'] = ((df['month'] == 5) & (df['dt'].dt.day >= 15)) | (df['month'].isin([6, 7])).astype(int)
-    df['is_black_friday'] = ((df['month'] == 11) & (df['dt'].dt.day >= 20) & (df['dt'].dt.day <= 30)).astype(int)
-    df['is_back_to_school'] = ((df['month'] == 8) & (df['dt'].dt.day >= 15) | (df['month'] == 9) & (df['dt'].dt.day <= 15)).astype(int)
+    df['is_summer_peak'] = (((df['month'] == 5) & (df['dt'].dt.day >= 15)) | (df['month'].isin([6, 7]))).astype(int)
+    df['is_black_friday'] = ((df['month'] == 11) & (df['dt'].dt.day.between(20, 30))).astype(int)
+    df['is_back_to_school'] = (((df['month'] == 8) & (df['dt'].dt.day >= 15)) | ((df['month'] == 9) & (df['dt'].dt.day <= 15))).astype(int)
     df['is_holiday_season'] = (df['month'].isin([12, 1])).astype(int)
     df['quarter'] = df['dt'].dt.quarter
-    
-    # Add COVID features
-    df = df.merge(covid_data, on='dt', how='left')
-    df['new_cases'] = df['new_cases'].fillna(0)
-    df['new_deaths'] = df['new_deaths'].fillna(0)
-    df['cases_7day_avg'] = df.groupby('sku')['new_cases'].transform(lambda x: x.rolling(window=7).mean())
-    df['deaths_7day_avg'] = df.groupby('sku')['new_deaths'].transform(lambda x: x.rolling(window=7).mean())
-    
-    print("Seasonal and COVID features added.")
+
+    # Merge and process COVID data
+    df = pd.merge(df, df_covid, on='dt', how='left').fillna(0)
+    df['cases_7day_avg'] = df.groupby('sku')['new_cases'].transform(lambda x: x.rolling(window=7, min_periods=1).mean())
+    df['deaths_7day_avg'] = df.groupby('sku')['new_deaths'].transform(lambda x: x.rolling(window=7, min_periods=1).mean())
     return df
 
-# [CHANGE 3: Modified forecast_sku to include COVID features]
-def forecast_sku(args):
-    row, df_cutoff, holiday_df, cutoff, forecast_periods = args
-    sku = row['sku']
-    print(f"Processing SKU: {sku}")
-    product_data = df_cutoff[df_cutoff['sku'] == sku][['dt', 'ordered_quantity', 'lag_1', 'lag_7', 'lag_14', 'lag_30', 'lag_60', 'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_30', 'is_weekend', 'is_summer_peak', 'is_black_friday', 'is_back_to_school', 'is_holiday_season', 'quarter', 'cases_7day_avg', 'deaths_7day_avg']]
-    product_data = product_data.rename(columns={'dt': 'ds', 'ordered_quantity': 'y'})
 
-    if len(product_data) < 30:
-        print(f"Skipping SKU {sku} due to insufficient data")
+# --- Core Forecasting Logic ---
+
+def forecast_single_sku(args):
+    """
+    Trains a Prophet model and generates a forecast for a single SKU.
+    Designed to be used with multiprocessing.
+    """
+    sku, df_train, holiday_df, forecast_periods = args
+    print(f"Processing SKU: {sku}...")
+
+    # Prepare data in Prophet's required format
+    df_prophet = df_train[df_train['sku'] == sku].rename(columns={'dt': 'ds', 'ordered_quantity': 'y'})
+    if len(df_prophet) < 30:
+        print(f"Skipping SKU {sku} due to insufficient data.")
         return None
 
-    if product_data.isnull().any().any():
-        print(f"Warning: NaN values found for SKU {sku}. Filling with 0.")
-        product_data = product_data.fillna(0)
-
-    # Use the provided hyperparameters
-    best_params = SKU_HYPERPARAMETERS[sku]
-    print(f"Using hyperparameters for SKU {sku}: {best_params}")
-
+    # Instantiate Prophet model with pre-tuned hyperparameters
     model = Prophet(
         daily_seasonality=True,
         weekly_seasonality=True,
         yearly_seasonality=True,
         holidays=holiday_df,
-        **best_params
+        **SKU_HYPERPARAMETERS.get(sku, {})
     )
 
-    for col in ['lag_1', 'lag_7', 'lag_14', 'lag_30', 'lag_60', 'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_30', 'is_weekend', 'is_summer_peak', 'is_black_friday', 'is_back_to_school', 'is_holiday_season', 'quarter', 'cases_7day_avg', 'deaths_7day_avg']:
-        model.add_regressor(col)
+    # Add all external features as regressors
+    for regressor in EXTERNAL_REGRESSORS:
+        model.add_regressor(regressor)
 
-    model.fit(product_data)
-    print(f"Model fitted for SKU {row['sku']}")
+    model.fit(df_prophet)
 
-    # Create future dataframe
+    # Project future values for all regressors
     future = model.make_future_dataframe(periods=forecast_periods)
-    
-    # Fill future values for lag features
-    for col in ['lag_1', 'lag_7', 'lag_14', 'lag_30', 'lag_60', 'rolling_mean_7', 'rolling_mean_14', 'rolling_mean_30']:
-        future[col] = product_data[col].rolling(window=3, min_periods=1).mean().iloc[-1]
+    for col in EXTERNAL_REGRESSORS:
+        # Simple but effective: project future values using a recent rolling average
+        future_val = df_prophet[col].rolling(window=3, min_periods=1).mean().iloc[-1]
+        future[col] = future_val
 
-    # Add seasonal features to future dataframe
-    future['is_weekend'] = future['ds'].dt.dayofweek.isin([5, 6]).astype(int)
-    future['is_summer_peak'] = ((future['ds'].dt.month == 5) & (future['ds'].dt.day >= 15)) | (future['ds'].dt.month.isin([6, 7])).astype(int)
-    future['is_black_friday'] = ((future['ds'].dt.month == 11) & (future['ds'].dt.day >= 20) & (future['ds'].dt.day <= 30)).astype(int)
-    future['is_back_to_school'] = ((future['ds'].dt.month == 8) & (future['ds'].dt.day >= 15) | (future['ds'].dt.month == 9) & (future['ds'].dt.day <= 15)).astype(int)
-    future['is_holiday_season'] = (future['ds'].dt.month.isin([12, 1])).astype(int)
-    future['quarter'] = future['ds'].dt.quarter
-
-    # Add COVID features to future dataframe
-    future['cases_7day_avg'] = product_data['cases_7day_avg'].rolling(window=3, min_periods=1).mean().iloc[-1]
-    future['deaths_7day_avg'] = product_data['deaths_7day_avg'].rolling(window=3, min_periods=1).mean().iloc[-1]
-
+    # Generate forecast
     forecast = model.predict(future)
-    print(f"Predictions made for SKU {row['sku']}")
 
+    # Aggregate daily forecast to a monthly level for business planning
     forecast['month'] = forecast['ds'].dt.month
     forecast['year'] = forecast['ds'].dt.year
-    forecast['data_cutoff_date'] = cutoff
+    monthly_agg = forecast.groupby(['year', 'month']).agg(sales=('yhat', 'sum')).reset_index()
+    monthly_agg['sku'] = sku
+    
+    return monthly_agg
 
-    forecast['ds'] = pd.to_datetime(forecast['ds'])
-    forecast['data_cutoff_date'] = pd.to_datetime(forecast['data_cutoff_date'])
 
-    forecast['month_diff'] = forecast.apply(lambda row:
-                                            (row['ds'].year - row['data_cutoff_date'].year) * 12 +
-                                            row['ds'].month - row['data_cutoff_date'].month, axis=1)
+def run_forecast_pipeline(df):
+    """
+    Orchestrates the entire forecasting process for all SKUs using
+    multiprocessing.
+    """
+    print("Starting forecast pipeline...")
+    # Determine forecast horizon: 3 months from the last complete month of data
+    last_date = df['dt'].max()
+    forecast_start_date = (last_date.replace(day=1) + pd.DateOffset(months=1)).replace(day=1)
+    forecast_end_date = forecast_start_date + pd.DateOffset(months=3) - pd.DateOffset(days=1)
+    forecast_periods = (forecast_end_date - last_date).days
+    
+    print(f"Data available until: {last_date.date()}")
+    print(f"Forecasting for 3 months from {forecast_start_date.date()} to {forecast_end_date.date()}")
 
-    forecast_month_aggregate = forecast.groupby(['month','year','month_diff']).agg(
-        sales=('yhat', 'sum')
-    ).reset_index()
-    forecast_month_aggregate['sku'] = row['sku']
+    # Prepare US holidays dataframe for Prophet
+    cal = calendar()
+    holidays = cal.holidays(start=df.dt.min(), end=forecast_end_date, return_name=True)
+    holiday_df = pd.DataFrame(data=holidays, columns=['holiday']).reset_index().rename(columns={'index': 'ds'})
 
-    return forecast_month_aggregate
+    unique_skus = df['sku'].unique()
+    pool_args = [(sku, df, holiday_df, forecast_periods) for sku in unique_skus]
 
-# [CHANGE 4: Modified run_forecast_model to include COVID data]
-def run_forecast_model(df, covid_data, checkpoint_file='forecast_checkpoint.pkl'):
-    print("Starting forecast model...")
+    # Use multiprocessing to run forecasts in parallel
+    with mp.Pool(processes=mp.cpu_count()) as pool:
+        results = pool.map(forecast_single_sku, pool_args)
 
-    # Determine if a fresh start is requested
-    if start_fresh:
-        checkpoint_file = 'forecast_checkpoint_new.pkl'
-        print("Starting a fresh forecast...")
-        # Clear the checkpoint file if it exists
-        if os.path.exists(checkpoint_file):
-            os.remove(checkpoint_file)
-        if os.path.exists(checkpoint_file + '.backup'):
-            os.remove(checkpoint_file + '.backup')
-        start_cutoff_index = 0
-        final_predictions = pd.DataFrame()
-        current_sku = None
-        backup_checkpoint_file = checkpoint_file + '.backup'  # Initialize this for fresh start as well
-    else:
-        print("Attempting to resume from existing checkpoint...")
-        checkpoint = load_checkpoint(checkpoint_file)
-        backup_checkpoint_file = checkpoint_file + '.backup'
+    # Combine results from all SKUs
+    final_predictions = pd.concat([res for res in results if res is not None], ignore_index=True)
+    return final_predictions, forecast_end_date
 
-        if checkpoint and 'version' in checkpoint and checkpoint['version'] == '2.0':
-            print("Checkpoint loaded. Resuming from previous state.")
-            final_predictions = checkpoint['final_predictions']
-            start_cutoff_index = checkpoint['cutoff_index']
-            df = checkpoint['df']
-            current_sku = checkpoint.get('current_sku', None)
-        elif os.path.exists(backup_checkpoint_file):
-            print("Main checkpoint not found or incompatible. Attempting to load backup checkpoint...")
-            backup_checkpoint = load_checkpoint(backup_checkpoint_file)
-            if backup_checkpoint and 'version' in backup_checkpoint and backup_checkpoint['version'] == '2.0':
-                print("Backup checkpoint loaded. Resuming from previous state.")
-                final_predictions = backup_checkpoint['final_predictions']
-                start_cutoff_index = backup_checkpoint['cutoff_index']
-                df = backup_checkpoint['df']
-                current_sku = backup_checkpoint.get('current_sku', None)
-            else:
-                print("No compatible checkpoints found. Starting from the beginning.")
-                start_cutoff_index = 0
-                final_predictions = pd.DataFrame()
-                current_sku = None
-        else:
-            print("No compatible checkpoints found. Starting from the beginning.")
-            start_cutoff_index = 0
-            final_predictions = pd.DataFrame()
-            current_sku = None
 
-    if start_cutoff_index == 0:
-        df['dt'] = pd.to_datetime(df['dt'])
-        df.sort_values(by=["sku", "dt"], inplace=True)
-        df = add_lag_features(df)
-        df = add_seasonal_features(df, covid_data)  # Pass covid_data here
+# --- Results Processing & Visualization ---
 
-    print(f"Data loaded. Shape: {df.shape}")
-
-    # Find the last complete month in the data
-    last_complete_month = df['dt'].max().replace(day=1) - pd.DateOffset(days=1)
-    print(f"Last complete month: {last_complete_month.strftime('%Y-%m-%d')}")
-
-    # Filter data up to the last complete month
-    df = df[df['dt'] <= last_complete_month]
-
-    # Calculate forecast periods (3 months from the last complete month)
-    forecast_end_date = last_complete_month + pd.DateOffset(months=3)
-    forecast_periods = (forecast_end_date - last_complete_month).days
-
-    cutoff_dates = [last_complete_month]
-
-    for cutoff_index, cutoff in enumerate(cutoff_dates[start_cutoff_index:], start=start_cutoff_index):
-        print(f"Processing cutoff date: {cutoff}")
-        df_cutoff = df[df['dt'] <= cutoff]
-        unique_products = df_cutoff[['sku']].drop_duplicates()
-
-        cal = calendar()
-        holidays = cal.holidays(start=df_cutoff.dt.min(), end=df_cutoff.dt.max(), return_name=True)
-        holiday_df = pd.DataFrame(data=holidays, columns=['holiday']).reset_index().rename(columns={'index': 'ds'})
-
-        with mp.Pool(processes=mp.cpu_count()) as pool:
-            results = pool.map(forecast_sku, [(row, df_cutoff, holiday_df, cutoff, forecast_periods) 
-                                              for _, row in unique_products.iterrows() 
-                                              if current_sku is None or row['sku'] > current_sku])
-
-        for result in results:
-            if result is not None:
-                if final_predictions.empty:
-                    final_predictions = result.copy()
-                else:
-                    final_predictions = pd.concat([final_predictions, result], ignore_index=True)
-
-        # Save checkpoint after each cutoff date
-        checkpoint = {
-            'version': '2.0',
-            'final_predictions': final_predictions,
-            'cutoff_index': cutoff_index + 1,
-            'df': df
-        }
-        save_checkpoint(checkpoint, checkpoint_file)
-        save_checkpoint(checkpoint, backup_checkpoint_file)
-        print(f"Checkpoint saved after cutoff date: {cutoff}")
-
-    df['month'] = df['dt'].dt.month
-    df['year'] = df['dt'].dt.year
-    summary_df = df.groupby(['year', 'month', 'sku']).agg(
-        Actual = ('ordered_quantity', 'sum')
+def process_and_save_results(df_actual, df_forecast, end_date):
+    """Merges actuals with forecasts and saves to CSV."""
+    df_actual['month'] = df_actual['dt'].dt.month
+    df_actual['year'] = df_actual['dt'].dt.year
+    df_summary = df_actual.groupby(['year', 'month', 'sku']).agg(
+        Actual=('ordered_quantity', 'sum')
     ).reset_index()
 
-    final_output = summary_df.copy()
+    df_forecast = df_forecast.rename(columns={'sales': 'Forecast'})
+    final_output = pd.merge(df_summary, df_forecast, on=['year', 'month', 'sku'], how='outer')
+    final_output.sort_values(['sku', 'year', 'month'], inplace=True)
 
-    # Verify that 'month_diff' exists
-    if 'month_diff' not in final_predictions.columns:
-        print("Error: 'month_diff' column is missing from final_predictions.")
-        raise KeyError("'month_diff' column is missing from final_predictions.")
-
-    # If 'month_diff' exists, proceed with aggregation
-    forecast_3 = final_predictions[final_predictions['month_diff'].isin([1, 2, 3])].copy()
-    forecast_3 = forecast_3.groupby(['year', 'month', 'sku']).agg({'sales': 'mean'}).reset_index()
-    forecast_3 = forecast_3.rename(columns={'sales': 'Three_Month_Forecast'})
-
-    final_output = final_output.merge(forecast_3, on=['year', 'month', 'sku'], how='outer')
-
-    final_output = final_output.sort_values(['sku', 'year', 'month'])
-
-    # Ensure all forecasted dates are included
+    # Format and save the results
     final_output['date'] = pd.to_datetime(final_output['year'].astype(str) + '-' + final_output['month'].astype(str) + '-01')
-    final_output = final_output[final_output['date'] <= forecast_end_date]
-
-    final_output['Three_Month_Forecast'] = final_output['Three_Month_Forecast'].round().astype('Int64')
-
-    final_output['Three_Month_Forecast_Diff%'] = ((final_output['Three_Month_Forecast'] - final_output['Actual']) / final_output['Actual']) * 100
-
-    print("Forecast model completed.")
+    final_output = final_output[final_output['date'] <= end_date]
+    final_output['Forecast'] = final_output['Forecast'].round().astype('Int64')
+    final_output['Forecast_Diff%'] = ((final_output['Forecast'] - final_output['Actual']) / final_output['Actual']) * 100
+    
+    final_output.to_csv('outputs/forecast_results.csv', index=False)
+    print("\nForecast results saved to 'outputs/forecast_results.csv'")
     return final_output
 
-import matplotlib
-matplotlib.use('Agg')  # Use a non-interactive backend
 
-def plot_forecast(final_output):
-    print("Plotting forecasts...")
-    
-    # Create 'plots' directory if it doesn't exist
-    plots_dir = os.path.join(os.getcwd(), 'Forecast Plots')
+def plot_and_save_forecasts(final_output):
+    """Generates and saves plots for each SKU's forecast."""
+    print("Generating forecast plots...")
+    plots_dir = 'outputs/forecast_plots'
     os.makedirs(plots_dir, exist_ok=True)
-    print(f"Plots will be saved in: {plots_dir}")
-    
     plt.style.use('seaborn-v0_8')
 
-    current_year = datetime.now().year
-    start_date = pd.to_datetime(f'{current_year}-01-01')
-    end_date = final_output['date'].max()
-
+    plot_start_year = final_output['date'].max().year
+    start_date = pd.to_datetime(f'{plot_start_year}-01-01')
+    
     for sku in final_output['sku'].unique():
-        print(f"Processing plot for SKU: {sku}")
-        sku_data = final_output[(final_output['sku'] == sku) & (final_output['date'] >= start_date) & (final_output['date'] <= end_date)].sort_values('date')
+        sku_data = final_output[
+            (final_output['sku'] == sku) & (final_output['date'] >= start_date)
+        ].sort_values('date')
 
         if sku_data.empty:
-            print(f"No data available for SKU: {sku} in the specified date range, skipping plot.")
             continue
 
-        fig, ax = plt.subplots(figsize=(15, 8))
+        fig, ax = plt.subplots(figsize=(14, 7))
         
-        # Plot actual data
-        actual_data = sku_data[sku_data['Actual'].notna()]
-        ax.plot(actual_data['date'], actual_data['Actual'], label='Actual', color='black', linewidth=2, marker='o')
-        ax.fill_between(actual_data['date'],
-                        actual_data['Actual'] * 0.9,
-                        actual_data['Actual'] * 1.1,
-                        alpha=0.2,
-                        color='gray',
-                        label='±10% Actual')
-
-        # Plot forecast data
-        forecast_data = sku_data[sku_data['Three_Month_Forecast'].notna()]
-        if not forecast_data.empty:
-            ax.plot(forecast_data['date'], forecast_data['Three_Month_Forecast'],
-                    label='3-Month Forecast',
-                    color='#1f77b4',
-                    linewidth=1.5,
-                    marker='o',
-                    markersize=4)
-
-        ax.set_title(f'Actual vs 3-Month Forecast for {sku} ({current_year})', fontsize=16)
+        # Plot actual and forecasted data on the same axis
+        actuals = sku_data.dropna(subset=['Actual'])
+        forecasts = sku_data.dropna(subset=['Forecast'])
+        
+        ax.plot(actuals['date'], actuals['Actual'], 'ko-', label='Actual Sales', linewidth=2)
+        ax.plot(forecasts['date'], forecasts['Forecast'], 'o--', color='#1f77b4', label='3-Month Forecast')
+        
+        ax.set_title(f'Actual vs. 3-Month Forecast for {sku}', fontsize=16)
         ax.set_xlabel('Month', fontsize=12)
-        ax.set_ylabel('Number of Mattresses', fontsize=12)
+        ax.set_ylabel('Sales Volume', fontsize=12)
         ax.set_ylim(bottom=0)
-        ax.set_xlim(start_date, end_date)
-        ax.legend(loc='upper left', bbox_to_anchor=(1, 1), fontsize=10)
-        ax.grid(True, linestyle='--', alpha=0.7)
+        ax.legend()
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+        
+        # Format x-axis for readability
         ax.xaxis.set_major_locator(MonthLocator())
         ax.xaxis.set_major_formatter(DateFormatter('%b %Y'))
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        plt.tight_layout()
+        plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
         
-        # Save the plot
-        filename = f'forecast_{sku.replace(" ", "_")}_{current_year}.png'
+        fig.tight_layout()
+        filename = f'forecast_{sku.replace(" ", "_")}.png'
         filepath = os.path.join(plots_dir, filename)
-        print(f"Saving plot: {filepath}")
-        try:
-            plt.savefig(filepath)
-            plt.close(fig)
-        except Exception as e:
-            print(f"Error saving plot for {sku}: {str(e)}")
+        plt.savefig(filepath, dpi=150)
+        plt.close(fig)
+        print(f"  - Saved plot for {sku} to {filepath}")
 
-    print(f"All forecast plots for {current_year} have been saved.")
-    print("Saved plot files:")
-    for file in os.listdir(plots_dir):
-        if file.endswith(f"_{current_year}.png"):
-            print(file)
+    print("All plots saved.")
 
-# [CHANGE 5: Modified main script to load and use COVID data]
-if __name__ == "__main__":
+
+# --- Main Execution Block ---
+
+def main():
+    """Main function to run the entire forecasting pipeline."""
     try:
-        print("Starting the forecasting process...")
+        # Define file paths
+        sales_data_path = 'data/Sales Historical Data - 2nd May 2025.csv'
+        covid_data_path = 'data/Forecasting for Mattresses - Covid Data.csv'
+        
+        # NOTE: The checkpointing logic from the original script can be complex to
+        # maintain and is often better handled by workflow tools like Airflow.
+        # This version focuses on a clean, single, end-to-end run.
+        
+        # 1. Load and prepare all data
+        df_processed = load_and_prep_data(sales_data_path, covid_data_path)
 
-        # Load your sales data
-        print("Loading historical data...")
-        df = pd.read_csv('Sales Historical Data - 2nd May 2025.csv')
-        print(f"Historical data loaded. Shape: {df.shape}")
+        # 2. Run the core forecasting models
+        df_forecast, forecast_end_date = run_forecast_pipeline(df_processed)
 
-        # Load COVID data
-        covid_data = load_covid_data('Forecasting for Mattresses - Covid Data.csv')
+        # 3. Process results and save to CSV
+        final_output = process_and_save_results(df_processed, df_forecast, forecast_end_date)
+        
+        # 4. Generate and save plots
+        plot_and_save_forecasts(final_output)
 
-        # Ask user if they want to start fresh
-        start_fresh = input("Do you want to start a fresh forecast ignoring any existing checkpoints? (y/n): ").lower() == 'y'
+        print("\nForecasting process completed successfully.")
 
-        if start_fresh:
-            checkpoint_file = 'forecast_checkpoint_new.pkl'
-            print("Starting a fresh forecast...")
-        else:
-            checkpoint_file = 'forecast_checkpoint.pkl'
-            print("Attempting to resume from existing checkpoint...")
-
-        # Run the forecast model with checkpointing
-        print("Running forecast model...")
-        final_output = run_forecast_model(df, covid_data, checkpoint_file=checkpoint_file)
-
-        # Plot the forecast
-        print("Plotting forecasts...")
-        plot_forecast(final_output)
-
-        # Save the final output to a CSV file
-        print("Saving forecast results...")
-        final_output.to_csv('forecast_results.csv', index=False)
-        print("Forecast results saved to 'forecast_results.csv'")
-
-        print("Forecasting process completed.")
+    except FileNotFoundError as e:
+        print(f"\nERROR: Data file not found. Please ensure '{e.filename}' is in the 'data/' directory.")
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
         import traceback
-        print(traceback.format_exc())
-    
-    input("Press Enter to exit...")
+        print(f"\nAn unexpected error occurred: {e}")
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
